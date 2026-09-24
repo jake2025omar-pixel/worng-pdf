@@ -1,0 +1,6 @@
+{
+  "name": "WORNG PDF - AI Resume & CV Builder",
+  "description": "AI-powered Arabic Resume and English ATS CV builder with dual-format export, instant parsing, and professional templates.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

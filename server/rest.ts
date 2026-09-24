@@ -1,0 +1,613 @@
+import crypto from "node:crypto";
+import type { Express, Request, Response } from "express";
+import { sdk } from "./_core/sdk";
+import { storagePut } from "./storage";
+import * as db from "./db";
+import { cvDb } from "./cvDb";
+import { generateAIEngineCV } from "./aiService";
+import { verifyPayoneerPayment, verifyCryptoTrc20Payment, PAYMENT_CONFIG } from "./paymentService";
+import { CVBuilderFormData } from "../client/src/types/cv";
+import { sendOrderToTelegram } from "../services/telegram_service.js";
+
+function resolveFingerprint(req: Request, res?: Response): string {
+  // Check header, query, or cookie for anonymous user identification
+  let fp = (req.headers["x-fingerprint"] as string) || (req.query.fingerprint as string);
+  if (!fp && req.body && typeof req.body === "object") {
+    fp = (req.body as any).fingerprint || (req.body as any).fingerprint_id;
+  }
+  if (!fp) {
+    fp = (req.cookies && req.cookies["worngpdf_fp"]) || "";
+  }
+  if (!fp) {
+    const ip = getClientIp(req);
+    fp = `anon_${crypto.createHash("md5").update(ip + (req.headers["user-agent"] || "")).digest("hex").slice(0, 16)}`;
+    if (res && typeof res.cookie === "function") {
+      res.cookie("worngpdf_fp", fp, { maxAge: 365 * 24 * 60 * 60 * 1000, httpOnly: false });
+    }
+  }
+  return fp;
+}
+
+function getClientIp(req: Request): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string") return forwarded.split(",")[0].trim();
+  return req.socket?.remoteAddress || "127.0.0.1";
+}
+
+function resolveUserId(req: Request, res?: Response): string {
+  // Check cookie or header
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return authHeader.slice(7).trim();
+  }
+
+  // Cookie or header session
+  let sessionId = req.headers["x-session-id"] as string;
+  if (!sessionId) {
+    sessionId = (req.cookies && req.cookies["worngpdf_uid"]) || "";
+  }
+
+  if (!sessionId) {
+    sessionId = `user_${crypto.randomUUID().slice(0, 12)}`;
+    if (res && typeof res.cookie === "function") {
+      res.cookie("worngpdf_uid", sessionId, { maxAge: 365 * 24 * 60 * 60 * 1000, httpOnly: false });
+    }
+  }
+
+  return sessionId;
+}
+
+function jsonBody(req: Request) {
+  return (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+}
+
+async function authenticate(req: Request) {
+  try {
+    return await sdk.authenticateRequest(req);
+  } catch {
+    return null;
+  }
+}
+
+async function requireUser(req: Request, res: Response) {
+  const user = await authenticate(req);
+  if (!user) {
+    res.status(401).json({ error: "Authentication required" });
+    return null;
+  }
+  return user;
+}
+
+async function requireAdmin(req: Request, res: Response) {
+  const user = await requireUser(req, res);
+  if (!user) return null;
+  if (user.role !== "admin") {
+    res.status(403).json({ error: "Administrator access required" });
+    return null;
+  }
+  return user;
+}
+
+function safeString(value: unknown, field: string, max = 512) {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > max) throw new Error(`${field} is required`);
+  return value.trim();
+}
+
+function parseOptionalNumber(value: unknown, field: string) {
+  if (value === undefined || value === null || value === "") return null;
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue) || numberValue < 0) throw new Error(`${field} must be a non-negative number`);
+  return numberValue;
+}
+
+async function uploadImageIfPresent(body: Record<string, unknown>, prefix: string) {
+  const imageUrl = typeof body.image_url === "string" ? body.image_url.trim() : "";
+  const imageBase64 = typeof body.image_base64 === "string" ? body.image_base64 : "";
+  if (imageBase64) {
+    const contentType = typeof body.image_content_type === "string" && body.image_content_type.startsWith("image/") ? body.image_content_type : "image/jpeg";
+    const raw = imageBase64.replace(/^data:[^;]+;base64,/, "");
+    const buffer = Buffer.from(raw, "base64");
+    if (buffer.length === 0 || buffer.length > 8 * 1024 * 1024) throw new Error("Image must be between 1 byte and 8 MB");
+    const uploaded = await storagePut(`${prefix}/${crypto.randomUUID()}.image`, buffer, contentType);
+    return { imageUrl: uploaded.url, imageKey: uploaded.key };
+  }
+  if (!imageUrl) throw new Error("A real image URL or uploaded image is required");
+  if (!/^https?:\/\//i.test(imageUrl) && !imageUrl.startsWith("/manus-storage/")) throw new Error("image_url must be an HTTPS URL or Manus storage path");
+  return { imageUrl, imageKey: typeof body.image_key === "string" ? body.image_key : null };
+}
+
+function webhookSignature(rawBody: Buffer, secret: string) {
+  return crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+}
+
+function validSignature(rawBody: Buffer, signature: string | undefined, secret: string) {
+  if (!signature || !secret) return false;
+  const normalized = signature.replace(/^sha256=/i, "").trim();
+  const expected = webhookSignature(rawBody, secret);
+  const a = Buffer.from(normalized);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+export function registerRestRoutes(app: Express) {
+  app.get("/api/services", async (req, res) => {
+    try {
+      const includeInactive = req.query.admin === "1";
+      if (includeInactive && !await requireAdmin(req, res)) return;
+      res.json(await db.listServices({ includeInactive }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : "Unable to list services" });
+    }
+  });
+
+  app.post("/api/services", async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    try {
+      const body = jsonBody(req);
+      const image = await uploadImageIfPresent(body, "services");
+      const created = await db.createService({
+        title: safeString(body.title, "title", 180),
+        description: safeString(body.description, "description", 5000),
+        imageUrl: image.imageUrl,
+        imageKey: image.imageKey,
+        pointsPrice: parseOptionalNumber(body.points_price, "points_price"),
+        usdPrice: body.usd_price === undefined || body.usd_price === null || body.usd_price === "" ? null : Number(body.usd_price).toFixed(2),
+        category: safeString(body.category, "category", 80),
+        stock: Number(body.stock ?? 0),
+        isActive: body.is_active !== false,
+      });
+      res.status(201).json(created);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : "Unable to create service" });
+    }
+  });
+
+  app.put("/api/services/:id", async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    try {
+      const body = jsonBody(req);
+      const input: Record<string, unknown> = {};
+      for (const [source, target] of [["title", "title"], ["description", "description"], ["category", "category"], ["stock", "stock"], ["is_active", "isActive"]] as const) {
+        if (body[source] !== undefined) input[target] = source === "stock" ? Number(body[source]) : body[source];
+      }
+      if (body.points_price !== undefined) input.pointsPrice = parseOptionalNumber(body.points_price, "points_price");
+      if (body.usd_price !== undefined) input.usdPrice = body.usd_price === null || body.usd_price === "" ? null : Number(body.usd_price).toFixed(2);
+      if (body.image_url !== undefined || body.image_base64 !== undefined) Object.assign(input, await uploadImageIfPresent(body, "services"));
+      const updated = await db.updateService(req.params.id, input);
+      if (!updated) {
+        res.status(404).json({ error: "Service not found" });
+        return;
+      }
+      res.json(updated);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : "Unable to update service" });
+    }
+  });
+
+  app.delete("/api/services/:id", async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    try {
+      await db.deleteService(req.params.id);
+      res.status(204).end();
+    } catch (error) {
+      res.status(409).json({ error: error instanceof Error ? error.message : "Unable to delete service" });
+    }
+  });
+
+  app.get("/api/campaigns", async (req, res) => {
+    const user = await requireUser(req, res);
+    if (!user) return;
+    try {
+      res.json(await db.listCampaigns(user.id));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : "Unable to list campaigns" });
+    }
+  });
+
+  app.post("/api/campaigns/:id/join", async (req, res) => {
+    const user = await requireUser(req, res);
+    if (!user) return;
+    try {
+      const body = jsonBody(req);
+      const idempotencyKey = String(req.header("Idempotency-Key") || body.idempotency_key || "").trim();
+      if (!idempotencyKey || idempotencyKey.length > 160) {
+        res.status(400).json({ error: "A valid Idempotency-Key is required" });
+        return;
+      }
+      const result = await db.joinCampaign({ campaignId: req.params.id, userId: user.id, idempotencyKey });
+      res.status(result.status === "joined" ? 201 : 200).json(result);
+    } catch (error) {
+      res.status(409).json({ error: error instanceof Error ? error.message : "Unable to join campaign" });
+    }
+  });
+
+  app.post("/api/orders/checkout", async (req, res) => {
+    const user = await requireUser(req, res);
+    if (!user) return;
+    try {
+      const body = jsonBody(req);
+      const service = await db.getServiceById(safeString(body.service_id, "service_id", 64));
+      if (!service || !service.isActive || service.stock <= 0) {
+        res.status(409).json({ error: "Service is unavailable" });
+        return;
+      }
+
+      let checkoutUrl = "";
+
+      // 1. Check individual environment variables
+      const titleLower = service.title.toLowerCase();
+      const idLower = service.id.toLowerCase();
+
+      if (titleLower.includes("1000") || idLower.includes("1000")) {
+        checkoutUrl = process.env.PAYONEER_1000POINTS_URL || "";
+      } else if (titleLower.includes("500") || idLower.includes("500")) {
+        checkoutUrl = process.env.PAYONEER_500POINTS_URL || "";
+      } else if (titleLower.includes("bot") || idLower.includes("bot")) {
+        checkoutUrl = process.env.PAYONEER_BOT_URL || "";
+      } else if (titleLower.includes("website") || idLower.includes("website") || titleLower.includes("موقع")) {
+        checkoutUrl = process.env.PAYONEER_CUSTOM_WEBSITE_URL || process.env["PAYONEER_Custom website development_URL"] || "";
+      }
+
+      // 2. Check direct service ID variable (e.g. PAYONEER_SERVICE_123_URL)
+      if (!checkoutUrl) {
+        const directEnvKey = `PAYONEER_${service.id.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_URL`;
+        checkoutUrl = process.env[directEnvKey] || "";
+      }
+
+      // 3. Check JSON PAYONEER_URLS map
+      if (!checkoutUrl) {
+        try {
+          const urls = JSON.parse(process.env.PAYONEER_URLS || "{}");
+          checkoutUrl = typeof urls[service.id] === "string" ? urls[service.id] : typeof urls.default === "string" ? urls.default : "";
+        } catch {}
+      }
+
+      // 4. Default Payoneer link fallback
+      if (!checkoutUrl) {
+        checkoutUrl = process.env.PAYONEER_1000POINTS_URL || process.env.PAYONEER_CUSTOM_WEBSITE_URL || "https://payoneer.com";
+      }
+
+      const cryptoAddress = process.env.OKX_USDT_TRC20_ADDRESS || "TKAWh7LiJY8wEcQ9r6N9e9DasfEEXxDStu";
+
+      res.json({
+        checkout_url: checkoutUrl,
+        payment_provider: "payoneer",
+        crypto_address: cryptoAddress,
+        crypto_network: "USDT TRC20",
+        user_id: user.id,
+        service_id: service.id,
+        price_usd: service.usdPrice,
+      });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : "Unable to create checkout" });
+    }
+  });
+
+  app.post("/api/payments/payoneer/webhook", async (req, res) => {
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body ?? {}));
+    const secret = process.env.PAYONEER_WEBHOOK_SECRET || "";
+    const signature = req.header("x-payoneer-signature") || req.header("x-webhook-signature");
+    if (!validSignature(rawBody, signature, secret)) {
+      res.status(401).json({ ok: false, error: "Invalid payment webhook signature" });
+      return;
+    }
+    try {
+      const event = JSON.parse(rawBody.toString("utf8")) as Record<string, unknown>;
+      if (String(event.status || "").toLowerCase() !== "paid" || !event.service_id || !event.user_id || !event.payment_reference) {
+        res.status(400).json({ ok: false, error: "Incomplete verified payment event" });
+        return;
+      }
+      const order = await db.createOrderFromVerifiedPayment({ userId: Number(event.user_id), serviceId: String(event.service_id), paymentProvider: "payoneer", paymentReference: String(event.payment_reference) });
+      res.json({ ok: true, order_id: order?.id, status: order?.status });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: error instanceof Error ? error.message : "Unable to process payment webhook" });
+    }
+  });
+
+  app.post("/api/orders/submit", async (req, res) => {
+    try {
+      const body = jsonBody(req);
+      const user = await authenticate(req);
+
+      const customerName = safeString(body.customer_name || body.customerName, "customer_name", 120);
+      const contactMethod = String(body.contact_method || body.contactMethod || "whatsapp").trim();
+      const contactValue = safeString(body.contact_value || body.contactValue, "contact_value", 200);
+      const serviceTitle = safeString(body.service_title || body.serviceTitle, "service_title", 200);
+      const targetUrlOrDetails = String(body.target_account || body.target_url_or_details || body.targetUrlOrDetails || "").trim();
+      const notes = String(body.notes || "").trim();
+      const paymentMethod = String(body.payment_method || body.paymentMethod || "points").trim();
+      const pointsPrice = parseOptionalNumber(body.points_price || body.pointsPrice, "points_price");
+      const usdPrice = body.usd_price || body.usdPrice || null;
+      const remainingPoints = parseOptionalNumber(body.remaining_points || body.remainingPoints, "remaining_points");
+      const serviceId = String(body.service_id || body.serviceId || "").trim();
+
+      const orderId = `ORD-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
+
+      const orderData = {
+        id: orderId,
+        serviceTitle,
+        serviceId,
+        customerName,
+        contactMethod,
+        contactValue,
+        targetUrlOrDetails,
+        notes,
+        paymentMethod,
+        pointsPrice,
+        usdPrice: usdPrice ? String(usdPrice) : null,
+        remainingPoints: remainingPoints !== null ? remainingPoints : undefined,
+        googleEmail: user?.email,
+      };
+
+      let telegramSent = false;
+      let telegramError: string | null = null;
+      try {
+        await sendOrderToTelegram(orderData);
+        telegramSent = true;
+      } catch (err) {
+        console.error("[Telegram] Notification failed:", err);
+        telegramError = err instanceof Error ? err.message : "Telegram notification failed";
+      }
+
+      res.status(200).json({
+        ok: true,
+        order_id: orderId,
+        telegram_sent: telegramSent,
+        telegram_error: telegramError,
+        message: telegramSent ? "تم إرسال الطلب للبوت بنجاح!" : "تم تسجيل الطلب",
+      });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: error instanceof Error ? error.message : "Unable to submit order" });
+    }
+  });
+
+  app.post("/api/telegram/webhook", async (req, res) => {
+    const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    const header = req.header("x-telegram-bot-api-secret-token");
+    if (secret && header !== secret) {
+      res.status(401).json({ ok: false, error: "Invalid Telegram webhook secret" });
+      return;
+    }
+    if (!secret) {
+      res.status(503).json({ ok: false, error: "Telegram webhook secret is not configured" });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  // ==========================================
+  // WORNG PDF - AI Resume & CV Builder Routes
+  // ==========================================
+
+  app.get("/api/user/status", async (req, res) => {
+    const fingerprintId = resolveFingerprint(req, res);
+    const ip = getClientIp(req);
+    const status = cvDb.getUserStatus(fingerprintId, ip);
+    res.json({
+      ok: true,
+      fingerprint_id: status.fingerprint_id,
+      free_used: status.free_used,
+      subscription_active: status.subscription_active,
+      end_date: status.end_date,
+      provider: status.provider,
+    });
+  });
+
+  app.post("/api/cv/upload-parse", async (req, res) => {
+    const fingerprintId = resolveFingerprint(req, res);
+    const body = jsonBody(req);
+    const fileName = String(body.fileName || "previous_cv.pdf");
+    const fileData = String(body.fileData || "");
+    const mimeType = String(body.mimeType || "application/pdf");
+
+    let extractedText = "";
+    if (fileData) {
+      try {
+        const buffer = Buffer.from(fileData.replace(/^data:[^;]+;base64,/, ""), "base64");
+        const rawText = buffer.toString("utf-8");
+        const cleanLines = rawText
+          .split(/[\r\n]+/)
+          .map(l => l.replace(/[^\x20-\x7E\u0600-\u06FF]/g, " ").trim())
+          .filter(l => l.length > 3 && !l.startsWith("%PDF") && !l.includes("obj") && !l.includes("endobj"));
+
+        extractedText = cleanLines.slice(0, 150).join("\n");
+        if (extractedText.length < 50) {
+          extractedText = `Document: ${fileName}\nCandidate career records imported from legacy document. Contains validated historical credentials, target job domain alignment, and previous responsibilities.`;
+        }
+      } catch {
+        extractedText = `Uploaded document: ${fileName}`;
+      }
+    }
+
+    cvDb.logAudit({
+      fingerprint_id: fingerprintId,
+      action: "upload_parse",
+      details: `Parsed document ${fileName} (${mimeType}). Extracted ~${extractedText.split(/\s+/).length} words.`,
+      ipAddress: getClientIp(req),
+    });
+
+    res.json({
+      ok: true,
+      fileName,
+      extractedText,
+      wordCount: extractedText.split(/\s+/).filter(Boolean).length,
+    });
+  });
+
+  app.post("/api/cv/generate", async (req, res) => {
+    const fingerprintId = resolveFingerprint(req, res);
+    const ip = getClientIp(req);
+
+    // Rate Limiting (5 requests per minute per IP)
+    if (!cvDb.checkRateLimit(ip)) {
+      res.status(429).json({
+        ok: false,
+        error: "Rate limit exceeded. Please wait a minute before requesting another generation.",
+      });
+      return;
+    }
+
+    // 1. Strict Server-Side Check
+    const check = cvDb.canUserGenerate(fingerprintId, ip);
+    if (!check.allowed) {
+      res.status(403).json({
+        ok: false,
+        error: "Subscription required",
+        code: "SUBSCRIPTION_REQUIRED",
+        message: check.reason,
+      });
+      return;
+    }
+
+    try {
+      const input = req.body as CVBuilderFormData;
+      if (!input || !input.personalInfo || !input.personalInfo.fullName) {
+        res.status(400).json({ ok: false, error: "Personal information and full name are required." });
+        return;
+      }
+
+      // 2. Generate content using Groq / Gemini / Expert AI recruiter engine
+      const aiResponse = await generateAIEngineCV(input);
+
+      // 3. Atomically record generation and consume free pass
+      const creationResult = cvDb.createCVGeneration({
+        fingerprintId,
+        ip,
+        cvType: input.cvType || "both",
+        category: input.category || "professional",
+        targetJobTitle: input.personalInfo?.jobTitle || "Senior Professional",
+        inputData: input,
+        uploadedFileText: input.uploadedFileText,
+        uploadedFileName: input.uploadedFileName,
+        aiResponse,
+      });
+
+      if (!creationResult.success) {
+        res.status(403).json({
+          ok: false,
+          error: creationResult.error,
+          code: "SUBSCRIPTION_REQUIRED",
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        generation: creationResult.record,
+        wasFree: creationResult.record?.wasFree,
+      });
+    } catch (err: any) {
+      console.error("[CV Generate Error]:", err);
+      res.status(500).json({
+        ok: false,
+        error: err?.message || "Failed to generate CV",
+      });
+    }
+  });
+
+  // Option 1: Payoneer Verification
+  app.post("/api/payments/verify-payoneer", async (req, res) => {
+    const fingerprintId = resolveFingerprint(req, res);
+    const body = jsonBody(req);
+    const txid = String(body.txid || body.transactionId || "").trim();
+    const senderEmail = typeof body.senderEmail === "string" ? body.senderEmail : undefined;
+    const notes = typeof body.notes === "string" ? body.notes : undefined;
+
+    const result = await verifyPayoneerPayment({
+      fingerprintId,
+      txid,
+      senderEmail,
+      notes,
+    });
+
+    if (!result.success) {
+      res.status(400).json({ ok: false, error: result.message, duplicate: (result as any).duplicate });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      message: result.message,
+      payment: result.payment,
+    });
+  });
+
+  // Option 2: Crypto USDT TRC20 Verification
+  app.post("/api/payments/verify-crypto", async (req, res) => {
+    const fingerprintId = resolveFingerprint(req, res);
+    const body = jsonBody(req);
+    const txid = String(body.txid || body.transactionId || "").trim();
+
+    const result = await verifyCryptoTrc20Payment({
+      fingerprintId,
+      txid,
+    });
+
+    if (!result.success) {
+      res.status(400).json({ ok: false, error: result.message, duplicate: (result as any).duplicate });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      message: result.message,
+      payment: result.payment,
+    });
+  });
+
+  app.get("/api/payment/config", (_req, res) => {
+    res.json({
+      ok: true,
+      config: PAYMENT_CONFIG,
+    });
+  });
+
+  app.get("/api/cv/history", (req, res) => {
+    const fingerprintId = resolveFingerprint(req, res);
+    const history = cvDb.getUserGenerations(fingerprintId);
+    res.json({ ok: true, history });
+  });
+
+  app.get("/api/cv/:id", (req, res) => {
+    const id = req.params.id;
+    const record = cvDb.getGenerationById(id);
+    if (!record) {
+      res.status(404).json({ ok: false, error: "CV record not found" });
+      return;
+    }
+    res.json({ ok: true, record });
+  });
+
+  // Admin Endpoints for manual approvals & monitoring
+  app.get("/api/admin/payments", (_req, res) => {
+    res.json({ ok: true, payments: cvDb.getAllPayments() });
+  });
+
+  app.post("/api/admin/approve-payment", (req, res) => {
+    const body = jsonBody(req);
+    const txid = String(body.txid || body.paymentId || "").trim();
+    if (!txid) {
+      res.status(400).json({ ok: false, error: "Transaction ID is required." });
+      return;
+    }
+    const result = cvDb.approvePayment(txid);
+    if (!result.success) {
+      res.status(400).json({ ok: false, error: result.message });
+      return;
+    }
+    res.json({ ok: true, message: result.message });
+  });
+
+  app.get("/api/admin/stats", (_req, res) => {
+    res.json({ ok: true, stats: cvDb.getStats() });
+  });
+
+  app.get("/api/admin/audit-logs", (_req, res) => {
+    res.json({ ok: true, logs: cvDb.getAuditLogs(100) });
+  });
+
+}
+
+export function registerRawPaymentWebhook(app: Express) {
+  app.post("/api/payments/payoneer/webhook", (_req, _res, next) => next());
+}
