@@ -19,6 +19,7 @@ import storeBotImg from "@/assets/store_order_bot.jpg";
 export const isGitHubPages =
   typeof window !== "undefined" &&
   (window.location.hostname.includes("github.io") ||
+    window.location.pathname.includes("/worng-pdf") ||
     window.location.pathname.includes("/customer-services-platform") ||
     window.location.port === "" ||
     !window.location.port);

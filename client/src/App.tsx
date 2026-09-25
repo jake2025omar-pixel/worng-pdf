@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Route, Switch } from "wouter";
+import { Router, Route, Switch } from "wouter";
+import { useHashLocation } from "wouter/use-hash-location";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import ErrorBoundary from "./components/ErrorBoundary";
@@ -48,36 +49,38 @@ export default function App() {
   return (
     <ErrorBoundary>
       <TooltipProvider>
-        <div className="min-h-screen text-[#1A1A1A] bg-[#F9F5EF] flex flex-col font-sans selection:bg-[#E8C4C4]/50 selection:text-[#1A1A1A] relative">
-          <ClayBackground />
-          <Navbar status={status} onRefreshStatus={fetchStatus} />
+        <Router hook={useHashLocation}>
+          <div className="min-h-screen text-[#1A1A1A] bg-[#F9F5EF] flex flex-col font-sans selection:bg-[#E8C4C4]/50 selection:text-[#1A1A1A] relative">
+            <ClayBackground />
+            <Navbar status={status} onRefreshStatus={fetchStatus} />
 
-          <main className="flex-1 relative z-10">
-            <Switch>
-              <Route path="/">
-                <LandingPage status={status} onRefreshStatus={fetchStatus} />
-              </Route>
-              <Route path="/builder">
-                <BuilderPage status={status} onRefreshStatus={fetchStatus} />
-              </Route>
-              <Route path="/templates">
-                <TemplatesPage />
-              </Route>
-              <Route path="/pricing">
-                <PricingPage status={status} onRefreshStatus={fetchStatus} />
-              </Route>
-              <Route path="/dashboard">
-                <DashboardPage status={status} onRefreshStatus={fetchStatus} />
-              </Route>
-              <Route path="/admin">
-                <Admin />
-              </Route>
-              <Route component={NotFound} />
-            </Switch>
-          </main>
+            <main className="flex-1 relative z-10">
+              <Switch>
+                <Route path="/">
+                  <LandingPage status={status} onRefreshStatus={fetchStatus} />
+                </Route>
+                <Route path="/builder">
+                  <BuilderPage status={status} onRefreshStatus={fetchStatus} />
+                </Route>
+                <Route path="/templates">
+                  <TemplatesPage />
+                </Route>
+                <Route path="/pricing">
+                  <PricingPage status={status} onRefreshStatus={fetchStatus} />
+                </Route>
+                <Route path="/dashboard">
+                  <DashboardPage status={status} onRefreshStatus={fetchStatus} />
+                </Route>
+                <Route path="/admin">
+                  <Admin />
+                </Route>
+                <Route component={NotFound} />
+              </Switch>
+            </main>
 
-          <Toaster position="bottom-right" richColors />
-        </div>
+            <Toaster position="bottom-right" richColors />
+          </div>
+        </Router>
       </TooltipProvider>
     </ErrorBoundary>
   );
